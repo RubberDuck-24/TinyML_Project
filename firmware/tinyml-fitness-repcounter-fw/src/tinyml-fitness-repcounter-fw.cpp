@@ -1,11 +1,3 @@
-/* 
- * Project TinyML Fitness RepCounter
- * Author: Christian Rasmussen
- * Date: 02/10/2025
- * For comprehensive documentation and examples, please visit:
- * https://docs.particle.io/firmware/best-practices/firmware-template/
- */
-
 #include "Particle.h"
 #include "Adafruit_SSD1306_RK.h"
 
@@ -28,7 +20,33 @@ const uint8_t REG_DEVID     = 0x00;
 const uint8_t REG_POWER_CTL = 0x2D;
 const uint8_t REG_DATAX0    = 0x32;
 
-// Helper: write one byte to a register
+// ======================
+// Buttons & DIP config
+// ======================
+
+// Start/Stop recording button
+const int BUTTON_PIN = D6;
+bool isActive = false;               // false = paused/idle, true = logging/active
+int lastButtonReading = HIGH;
+int stableButtonState  = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long DEBOUNCE_MS = 50;
+
+// Rep marker button (ground truth reps)
+const int REP_BUTTON_PIN = D5;
+int lastRepReading = HIGH;
+int stableRepState = HIGH;
+unsigned long lastRepDebounceTime = 0;
+unsigned long repGt = 0;            // ground-truth rep counter
+
+// DIP switch pins for exercise selection
+const int DIP_SW0_PIN = A0;         // LSB
+const int DIP_SW1_PIN = A1;         // MSB
+
+// ======================
+// ADXL343 helpers
+// ======================
+
 void adxlWrite(uint8_t reg, uint8_t value) {
     Wire.beginTransmission(ADXL343_ADDR);
     Wire.write(reg);
@@ -36,7 +54,6 @@ void adxlWrite(uint8_t reg, uint8_t value) {
     Wire.endTransmission();
 }
 
-// Helper: read one byte from a register
 uint8_t adxlRead(uint8_t reg) {
     Wire.beginTransmission(ADXL343_ADDR);
     Wire.write(reg);
@@ -48,7 +65,6 @@ uint8_t adxlRead(uint8_t reg) {
     return 0;
 }
 
-// Helper: read multiple bytes starting at a register
 void adxlReadBytes(uint8_t startReg, uint8_t *buffer, uint8_t len) {
     Wire.beginTransmission(ADXL343_ADDR);
     Wire.write(startReg);
@@ -61,40 +77,42 @@ void adxlReadBytes(uint8_t startReg, uint8_t *buffer, uint8_t len) {
 }
 
 // ======================
-// Label + serial commands
+// Label handling
 // ======================
-String currentLabel = "idle";   // default
-String serialBuffer = "";       // accumulate chars from Serial
 
-void updateDisplay(float xG, float yG, float zG) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(WHITE);
+// Label from DIP switches (exercise selection)
+String exerciseLabel = "idle";   // "idle", "pushup", "squat", "pullup"
 
-    display.setCursor(0, 0);
-    display.println("TinyML Logger");
+// Optional: serial buffer (still there if you want to debug via serial)
+String serialBuffer = "";
 
-    display.setCursor(0, 16);
-    if (currentLabel == "idle") {
-        display.println("Status: Idle");
-    } else {
-        display.print("REC: ");
-        display.println(currentLabel);
+void updateLabelFromDip() {
+    // Active-low switches: ON = LOW = 1
+    int b0 = (digitalRead(DIP_SW0_PIN) == LOW) ? 1 : 0;
+    int b1 = (digitalRead(DIP_SW1_PIN) == LOW) ? 1 : 0;
+
+    int mode = (b1 << 1) | b0;
+
+    switch (mode) {
+        case 0:
+            exerciseLabel = "idle";
+            break;
+        case 1:
+            exerciseLabel = "pushup";
+            break;
+        case 2:
+            exerciseLabel = "squat";
+            break;
+        case 3:
+            exerciseLabel = "pullup";
+            break;
+        default:
+            exerciseLabel = "idle";
+            break;
     }
-
-    display.setCursor(0, 32);
-    display.print("X: ");
-    display.println(xG, 2);
-    display.setCursor(0, 40);
-    display.print("Y: ");
-    display.println(yG, 2);
-    display.setCursor(0, 48);
-    display.print("Z: ");
-    display.println(zG, 2);
-
-    display.display();
 }
 
+// You can still use serial to print debug, but label now comes from DIP.
 void handleSerialCommands() {
     while (Serial.available()) {
         char c = Serial.read();
@@ -103,8 +121,9 @@ void handleSerialCommands() {
             if (serialBuffer.length() > 0) {
                 serialBuffer.trim();
                 if (serialBuffer.length() > 0) {
-                    currentLabel = serialBuffer;
-                    Serial.printlnf("# Label changed to: %s", currentLabel.c_str());
+                    // For now we just log the input, but DO NOT override exerciseLabel,
+                    // since we use the DIP switches for labeling.
+                    Serial.printlnf("# Serial command received: %s", serialBuffer.c_str());
                 }
                 serialBuffer = "";
             }
@@ -117,13 +136,104 @@ void handleSerialCommands() {
 }
 
 // ======================
+// OLED update
+// ======================
+
+void updateDisplay(float xG, float yG, float zG) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+
+    display.setCursor(0, 0);
+    display.println("TinyML Logger");
+
+    display.setCursor(0, 16);
+    if (!isActive) {
+        display.println("Status: Paused");
+    } else {
+        display.print("REC: ");
+        display.println(exerciseLabel);
+    }
+
+    display.setCursor(0, 32);
+    display.print("X: ");
+    display.println(xG, 2);
+    display.setCursor(0, 40);
+    display.print("Y: ");
+    display.println(yG, 2);
+    display.setCursor(0, 48);
+    display.print("Z: ");
+    display.println(zG, 2);
+
+    // Optional: show rep GT on bottom right
+    display.setCursor(80, 0);
+    display.print("Rep:");
+    display.println((int)repGt);
+
+    display.display();
+}
+
+// ======================
+// Button handling (debounced)
+// ======================
+
+void handleStartStopButton() {
+    int reading = digitalRead(BUTTON_PIN);
+
+    if (reading != lastButtonReading) {
+        lastDebounceTime = millis();
+        lastButtonReading = reading;
+    }
+
+    if ((millis() - lastDebounceTime) > DEBOUNCE_MS) {
+        if (reading != stableButtonState) {
+            stableButtonState = reading;
+
+            // Active-low button: pressed when reading == LOW
+            if (stableButtonState == LOW) {
+                isActive = !isActive;
+                Serial.printlnf("# Start/Stop button pressed. isActive = %s", isActive ? "true" : "false");
+            }
+        }
+    }
+}
+
+void handleRepButton() {
+    int reading = digitalRead(REP_BUTTON_PIN);
+
+    if (reading != lastRepReading) {
+        lastRepDebounceTime = millis();
+        lastRepReading = reading;
+    }
+
+    if ((millis() - lastRepDebounceTime) > DEBOUNCE_MS) {
+        if (reading != stableRepState) {
+            stableRepState = reading;
+
+            // Active-low: increment rep counter on press
+            if (stableRepState == LOW) {
+                repGt++;
+                Serial.printlnf("# Rep marker pressed. rep_gt = %lu", repGt);
+            }
+        }
+    }
+}
+
+// ======================
 // setup()
 // ======================
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
 
     Serial.println("# TinyML fitness data logger starting...");
+
+    // Buttons & DIP
+    pinMode(BUTTON_PIN, INPUT_PULLUP);      // start/stop
+    pinMode(REP_BUTTON_PIN, INPUT_PULLUP);  // rep marker
+    pinMode(DIP_SW0_PIN, INPUT_PULLUP);
+    pinMode(DIP_SW1_PIN, INPUT_PULLUP);
 
     Wire.begin(); // shared I2C bus: ADXL343 + OLED
 
@@ -152,18 +262,26 @@ void setup() {
     }
     display.clearDisplay();
     display.display();
+
+    updateLabelFromDip();  // initial label from DIP
     updateDisplay(0.0f, 0.0f, 1.0f);
     Serial.println("# OLED OK.");
 
-    // CSV header
-    Serial.println("timestamp_ms,ax,ay,az,label");
+    // CSV header with rep_gt column
+    Serial.println("timestamp_ms,ax,ay,az,label,rep_gt");
 }
 
 // ======================
 // loop()
 // ======================
+
 void loop() {
-    handleSerialCommands(); // may change currentLabel
+    handleStartStopButton(); // may toggle isActive
+    handleRepButton();       // may increment repGt
+    handleSerialCommands();  // optional serial debug
+
+    // Always read label from DIP (in case you flip it between sets)
+    updateLabelFromDip();
 
     // --- Read accelerometer ---
     uint8_t rawData[6];
@@ -178,11 +296,15 @@ void loop() {
     float yG = yRaw * scale_g_per_lsb;
     float zG = zRaw * scale_g_per_lsb;
 
+    // Effective label: when paused, force "idle"
+    String effectiveLabel = (isActive ? exerciseLabel : "idle");
+
     // --- CSV data output ---
-    Serial.printlnf("%lu,%.4f,%.4f,%.4f,%s",
+    Serial.printlnf("%lu,%.4f,%.4f,%.4f,%s,%lu",
                     millis(),
                     xG, yG, zG,
-                    currentLabel.c_str());
+                    effectiveLabel.c_str(),
+                    repGt);
 
     // --- Update OLED ---
     updateDisplay(xG, yG, zG);
